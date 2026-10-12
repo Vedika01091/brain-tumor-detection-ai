@@ -1,28 +1,23 @@
 """Flask API for the Brain Tumor Detection system.
 
-Supports two interchangeable model backends behind the same API contract
-(selected via the MODEL_BACKEND env var; "efficientnet" is the default):
-
-  - "efficientnet": PyTorch EfficientNet-B0, full fine-tune, trained by
-    "new model/main.py". Checkpoint + metrics live in model/efficientnet/.
-  - "vgg16": the original two-stage VGG16 model (conv feature extractor +
-    dense classifier head) produced by ml/train.py. Checkpoint + metrics
-    live in model/. Kept working, but no longer the default.
+Serves the fine-tuned PyTorch EfficientNet-B0 model (model/efficientnet_v2/) and returns, for each uploaded
+MRI slice, the predicted class, the probability of every class and a Grad-CAM heatmap overlay.
 
 Routes:
   GET  /api/health        - liveness + whether the trained model is loaded
-  GET  /api/model-info     - class list + saved evaluation metrics (if any)
+  GET  /api/model-info     - class list + saved evaluation metrics
   POST /api/predict        - multipart image upload -> prediction + Grad-CAM
 
-Run with:  venv/Scripts/python.exe backend/app.py
+Run with:  venv/bin/python backend/app.py   (Windows: venv\\Scripts\\python.exe backend\\app.py)
+
+Environment variables: EFFICIENTNET_CHECKPOINT (use another .pth file or extracted .pth folder),
+BACKEND_HOST / BACKEND_PORT (default 127.0.0.1 / 5000), FLASK_DEBUG=1 (development only).
 """
 import base64
 import io
 import json
 import os
-import sys
-
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+import threading
 
 import numpy as np
 from flask import Flask, jsonify, request
@@ -30,117 +25,65 @@ from flask_cors import CORS
 from PIL import Image
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_DIR = os.path.join(BASE_DIR, "model")
-EFFICIENTNET_DIR = os.path.join(MODEL_DIR, "efficientnet")
-sys.path.insert(0, os.path.join(BASE_DIR, "ml"))
+MODEL_DIR = os.path.join(BASE_DIR, "model", "efficientnet_v2")
+DEFAULT_CHECKPOINT = os.path.join(MODEL_DIR, "brain_tumor_efficientnet_v2.pth")
+CLASSES_PATH = os.path.join(MODEL_DIR, "class_indices.json")
+REPORT_PATH = os.path.join(MODEL_DIR, "evaluation_report.json")
 
-IMG_SIZE = (224, 224)
 DISPLAY_MAX_SIDE = 512
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "bmp"}
-MODEL_BACKEND = os.environ.get("MODEL_BACKEND", "efficientnet").strip().lower()
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB
 CORS(app)
 
 _state = {
-    "backend": MODEL_BACKEND,
     "loaded": False,
     "load_error": None,
     "class_names": None,
-    # "vgg16" backend (TensorFlow)
-    "base_model": None,
-    "head_model": None,
-    "grad_model": None,
-    "preprocess_input": None,
-    # "efficientnet" backend (PyTorch)
     "torch_model": None,
     "gradcam": None,
 }
 
-
-def _load_vgg16_model():
-    import tensorflow as tf  # imported lazily so /api/health responds fast even mid-import
-    from tensorflow.keras.applications.vgg16 import preprocess_input
-    from gradcam import build_grad_model, compute_gradcam
-
-    base_path = os.path.join(MODEL_DIR, "vgg16_base.keras")
-    head_path = os.path.join(MODEL_DIR, "classifier_head.keras")
-    classes_path = os.path.join(MODEL_DIR, "class_indices.json")
-
-    if not (os.path.exists(base_path) and os.path.exists(head_path)):
-        _state["load_error"] = (
-            "Trained VGG16 model files not found in model/. Run ml/train.py first."
-        )
-        return
-
-    base_model = tf.keras.models.load_model(base_path)
-    head_model = tf.keras.models.load_model(head_path)
-    with open(classes_path) as f:
-        class_names = json.load(f)
-
-    # Warm up the exact code path a real request takes (including the
-    # Grad-CAM GradientTape call, not just a plain forward pass) so any
-    # first-call tracing quirks happen once here at startup, not on a
-    # user's first request.
-    grad_model = build_grad_model(base_model)
-    dummy = np.zeros((1, 224, 224, 3), dtype=np.float32)
-    compute_gradcam(dummy, grad_model, head_model)
-
-    _state["base_model"] = base_model
-    _state["head_model"] = head_model
-    _state["grad_model"] = grad_model
-    _state["class_names"] = class_names
-    _state["preprocess_input"] = preprocess_input
-    _state["loaded"] = True
-    app.logger.info("VGG16 model loaded successfully: classes=%s", class_names)
-
-
-def _load_efficientnet_model():
-    from efficientnet_infer import build_gradcam, load_model, predict_with_gradcam
-
-    checkpoint_path = os.path.join(EFFICIENTNET_DIR, "brain_tumor_efficientnet_best.pth")
-    classes_path = os.path.join(EFFICIENTNET_DIR, "class_indices.json")
-
-    if not (os.path.exists(checkpoint_path) and os.path.exists(classes_path)):
-        _state["load_error"] = (
-            "Trained EfficientNet checkpoint not found in model/efficientnet/. "
-            "Run 'new model/main.py' first."
-        )
-        return
-
-    with open(classes_path) as f:
-        class_names = json.load(f)
-
-    model = load_model(checkpoint_path, len(class_names))
-    gradcam = build_gradcam(model)
-
-    # Warm up the exact code path a real request takes (including the
-    # Grad-CAM backward pass), so any first-call overhead happens once here
-    # at startup, not on a user's first request.
-    dummy = Image.new("RGB", (224, 224))
-    predict_with_gradcam(dummy, dummy, gradcam, class_names)
-
-    _state["torch_model"] = model
-    _state["gradcam"] = gradcam
-    _state["class_names"] = class_names
-    _state["loaded"] = True
-    app.logger.info("EfficientNet model loaded successfully: classes=%s", class_names)
+# Flask's dev server handles requests on several threads, but the model and its Grad-CAM hooks keep
+# per-call state on shared objects. Running two inferences at once corrupted that state and crashed the
+# process, so model loading and inference are serialised with this lock.
+_infer_lock = threading.RLock()
 
 
 def _load_models():
+    with _infer_lock:
+        _load_models_locked()
+
+
+def _load_models_locked():
     if _state["loaded"]:
         return
     _state["load_error"] = None
     try:
-        if _state["backend"] == "efficientnet":
-            _load_efficientnet_model()
-        elif _state["backend"] == "vgg16":
-            _load_vgg16_model()
-        else:
-            _state["load_error"] = (
-                f"Unknown MODEL_BACKEND '{_state['backend']}' (expected 'efficientnet' or 'vgg16')."
-            )
+        from efficientnet_infer import build_gradcam, load_model, predict_with_gradcam
+
+        checkpoint_path = os.environ.get("EFFICIENTNET_CHECKPOINT") or DEFAULT_CHECKPOINT
+        if not (os.path.exists(checkpoint_path) and os.path.exists(CLASSES_PATH)):
+            _state["load_error"] = f"Trained model not found: {checkpoint_path}"
+            return
+
+        with open(CLASSES_PATH) as f:
+            class_names = json.load(f)
+
+        model = load_model(checkpoint_path, len(class_names))
+        gradcam = build_gradcam(model)
+
+        # Warm up the exact code path a real request takes (including the Grad-CAM backward pass),
+        # so first-call overhead happens once here and not on a user's first request.
+        dummy = Image.new("RGB", (224, 224))
+        predict_with_gradcam(dummy, dummy, gradcam, class_names)
+
+        _state["torch_model"] = model
+        _state["gradcam"] = gradcam
+        _state["class_names"] = class_names
+        _state["loaded"] = True
+        app.logger.info("EfficientNet model loaded successfully: classes=%s", class_names)
     except Exception as e:  # noqa: BLE001 - surfaced to /api/health and /api/predict
         _state["load_error"] = str(e)
         app.logger.exception("Failed to load model")
@@ -166,6 +109,11 @@ def resize_for_display(img: Image.Image):
     return img
 
 
+@app.errorhandler(413)
+def too_large(_e):
+    return jsonify({"error": "File is too large (maximum 16 MB)."}), 413
+
+
 @app.route("/api/health")
 def health():
     _load_models()
@@ -173,7 +121,7 @@ def health():
         "status": "ok",
         "model_loaded": _state["loaded"],
         "error": _state["load_error"],
-        "backend": _state["backend"],
+        "backend": "efficientnet",
     })
 
 
@@ -183,17 +131,15 @@ def model_info():
     if _state["load_error"]:
         return jsonify({"error": _state["load_error"]}), 503
 
-    report_dir = EFFICIENTNET_DIR if _state["backend"] == "efficientnet" else MODEL_DIR
     metrics = None
-    report_path = os.path.join(report_dir, "evaluation_report.json")
-    if os.path.exists(report_path):
-        with open(report_path) as f:
+    if os.path.exists(REPORT_PATH):
+        with open(REPORT_PATH) as f:
             metrics = json.load(f)
 
     return jsonify({
         "classes": _state["class_names"],
         "metrics": metrics,
-        "backend": _state["backend"],
+        "backend": "efficientnet",
     })
 
 
@@ -219,15 +165,9 @@ def predict():
     display_arr = np.array(display_img).astype(np.uint8)
     class_names = _state["class_names"]
 
-    if _state["backend"] == "efficientnet":
-        from efficientnet_infer import overlay_heatmap_on_image, predict_with_gradcam
+    from efficientnet_infer import overlay_heatmap_on_image, predict_with_gradcam
+    with _infer_lock:
         heatmap, pred_idx, probs = predict_with_gradcam(raw, display_img, _state["gradcam"], class_names)
-    else:
-        from gradcam import compute_gradcam, overlay_heatmap_on_image
-        model_img = raw.resize(IMG_SIZE, Image.LANCZOS)
-        model_arr = np.array(model_img).astype(np.float32)
-        batch = _state["preprocess_input"](np.expand_dims(model_arr, axis=0))
-        heatmap, pred_idx, probs = compute_gradcam(batch, _state["grad_model"], _state["head_model"])
 
     pred_class = class_names[pred_idx]
     confidence = float(probs[pred_idx])
@@ -245,4 +185,12 @@ def predict():
 
 if __name__ == "__main__":
     _load_models()
-    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
+    # Debug mode exposes the Werkzeug interactive debugger, so it is opt-in
+    # (FLASK_DEBUG=1) and the server only listens on localhost unless
+    # BACKEND_HOST says otherwise (e.g. 0.0.0.0 inside a container).
+    app.run(
+        host=os.environ.get("BACKEND_HOST", "127.0.0.1"),
+        port=int(os.environ.get("BACKEND_PORT", "5000")),
+        debug=os.environ.get("FLASK_DEBUG") == "1",
+        use_reloader=False,
+    )
