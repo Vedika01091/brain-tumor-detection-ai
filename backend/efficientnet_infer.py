@@ -1,16 +1,12 @@
 """PyTorch EfficientNet-B0 inference + Grad-CAM for the Flask backend.
 
-Mirrors the architecture, checkpoint format and preprocessing used by
-"new model/main.py" (training script) so that predictions made here match
-what the model was actually trained on: brain-region crop -> resize to
-224x224 -> ImageNet normalization.
-
-Kept separate from "new model/gradcam.py" (used for offline report figures)
-to avoid a module-name collision with ml/gradcam.py (the TensorFlow Grad-CAM
-helper the Flask app also imports as `gradcam` for the VGG16 backend) and to
-return a Grad-CAM heatmap already mapped back onto the *uncropped* display
-image, which the report-figure script has no need for.
+Preprocessing matches what the model was trained on: brain-region crop -> resize to 224x224 -> ImageNet
+normalization. The Grad-CAM heatmap is mapped back onto the *uncropped* display image.
 """
+import io
+import os
+import zipfile
+
 import cv2
 import numpy as np
 import torch
@@ -27,8 +23,8 @@ _NORMALIZE = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224,
 def crop_brain_region_bbox(img, threshold=10, padding=4):
     """Bounding box (x0, y0, x1, y1) of the non-black brain tissue region.
 
-    Returns a box instead of the cropped image (unlike the CropBrainRegion
-    used at training time) so a Grad-CAM heatmap computed on the crop can be
+    Returns a box instead of the cropped image (unlike the crop used at
+    training time) so a Grad-CAM heatmap computed on the crop can be
     pasted back at the right location in the full, uncropped display image.
     """
     gray = np.array(img.convert("L"))
@@ -47,7 +43,7 @@ def crop_brain_region_bbox(img, threshold=10, padding=4):
 
 
 def build_model(num_classes):
-    """Same architecture as the classifier head trained in new model/main.py."""
+    """EfficientNet-B0 with a dropout + linear 4-class head."""
     model = models.efficientnet_b0(weights=None)
     num_features = model.classifier[1].in_features
     model.classifier[1] = nn.Sequential(
@@ -57,9 +53,32 @@ def build_model(num_classes):
     return model
 
 
+def _load_state_dict(checkpoint_path):
+    """Load a state dict from a .pth file, or from an *extracted* .pth.
+
+    A .pth written by torch.save is a zip archive. Some copies get unzipped
+    into a folder (data.pkl, data/0, data/1, ...); torch.load can't read a
+    folder, so re-pack its files into an in-memory zip and load that.
+    """
+    if not os.path.isdir(checkpoint_path):
+        return torch.load(checkpoint_path, map_location="cpu")
+
+    root = os.path.basename(os.path.normpath(checkpoint_path))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+        for dirpath, _, filenames in os.walk(checkpoint_path):
+            for fname in filenames:
+                full = os.path.join(dirpath, fname)
+                arcname = f"{root}/{os.path.relpath(full, checkpoint_path)}".replace(os.sep, "/")
+                with open(full, "rb") as f:
+                    z.writestr(arcname, f.read())
+    buf.seek(0)
+    return torch.load(buf, map_location="cpu")
+
+
 def load_model(checkpoint_path, num_classes):
     model = build_model(num_classes)
-    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = _load_state_dict(checkpoint_path)
     model.load_state_dict(state_dict)
     model.eval()
     return model
@@ -67,7 +86,7 @@ def load_model(checkpoint_path, num_classes):
 
 class GradCAM:
     """Standard Grad-CAM hooked onto a target conv layer, matching
-    "new model/gradcam.py"'s GradCAM class.
+    a standard Grad-CAM implementation.
     """
 
     def __init__(self, model, target_layer):
@@ -117,7 +136,7 @@ class GradCAM:
 def build_gradcam(model):
     """Target layer: model.features[-1], the final 1x1 "head" conv of
     EfficientNet-B0 - highest-level semantic features while still retaining
-    a spatial map to visualize. Matches new model/gradcam.py.
+    a spatial map to visualize. 
     """
     return GradCAM(model, model.features[-1])
 
@@ -134,8 +153,7 @@ def predict_with_gradcam(raw_img, display_img, gradcam, class_names):
     identical to raw_img if it was already small enough).
 
     The brain-region crop bounding box MUST be computed on raw_img, not on
-    a possibly-downscaled display_img: training (new model/main.py's
-    CropBrainRegion) always runs on the native-resolution file, and its
+    a possibly-downscaled display_img: training always runs on the native-resolution file, and its
     fixed 4px padding means cropping a downscaled copy instead shifts the
     box relative to what the model was trained on - a real train/serve
     skew for any image whose longer side exceeds DISPLAY_MAX_SIDE.
@@ -168,10 +186,7 @@ def predict_with_gradcam(raw_img, display_img, gradcam, class_names):
 def overlay_heatmap_on_image(heatmap, original_rgb_uint8, alpha=0.4):
     """original_rgb_uint8: HxWx3 uint8 RGB image at display resolution.
 
-    Identical in behavior to ml/gradcam.py's version of this function (pure
-    numpy + cv2, no framework dependency) - duplicated here rather than
-    imported so this module never pulls in TensorFlow just to serve the
-    EfficientNet backend.
+    Pure numpy + cv2: blends a JET-coloured heatmap over the image.
     """
     h, w = original_rgb_uint8.shape[:2]
     heatmap_resized = cv2.resize(heatmap, (w, h))
